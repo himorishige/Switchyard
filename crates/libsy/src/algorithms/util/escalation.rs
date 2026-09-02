@@ -13,7 +13,7 @@ use switchyard_protocol::{ContentBlock, Message, ModelId, Role};
 use super::classifier_contract::{ClassifierContract, ClassifierContractConfig};
 use super::llm_judge::{
     ClassifierInput, JudgeClassifier, JudgePolicy, JudgeRuntimeConfig, SerdeDecoder,
-    StructuredJudge,
+    StructuredJudge, attachment_placeholder,
 };
 use crate::core::classifier::{Classification, Score};
 use crate::core::state::State;
@@ -205,7 +205,12 @@ fn collect_text(content: &[ContentBlock], parts: &mut Vec<String>) {
                 parts.push(format!("tool_call {}({})", call.name, call.arguments));
             }
             ContentBlock::ToolResult(result) => collect_text(&result.content, parts),
-            _ => {}
+            // An attachment is part of the task even though the judge cannot read it.
+            other => {
+                if let Some(placeholder) = attachment_placeholder(other) {
+                    parts.push(placeholder);
+                }
+            }
         }
     }
 }
@@ -525,5 +530,28 @@ mod tests {
         assert!(summary.contains("[user (task)] task"), "{summary}");
         assert!(summary.contains("19 xxx"), "{summary}");
         assert!(!summary.contains("0 xxx"), "{summary}");
+    }
+    #[test]
+    fn message_text_marks_attachments_instead_of_dropping_them() {
+        use switchyard_protocol::ImageSource;
+
+        let message = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "fix the error in this screenshot".to_string(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Url {
+                        url: "https://example.invalid/shot.png".to_string(),
+                        detail: None,
+                    },
+                },
+            ],
+        };
+        let text = message_text(&message);
+        assert!(text.contains("fix the error in this screenshot"), "{text}");
+        assert!(text.contains("[image attachment]"), "{text}");
+        assert!(!text.contains("example.invalid"), "{text}");
     }
 }
