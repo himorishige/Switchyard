@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use switchyard_protocol::{
-    AggLlmResponse, InstructionBlock, LlmRequest, Message, OutputParams, Role, completion_text,
+    AggLlmResponse, ContentBlock, FileSource, InstructionBlock, LlmRequest, Message, OutputParams,
+    Role, completion_text,
 };
 
 use super::classifier_contract::ClassifierContract;
@@ -107,6 +108,54 @@ impl JudgeRuntimeConfig {
     }
 }
 
+/// Text placeholder a judge sees in place of a content block it may not be able to consume.
+///
+/// A judge is usually a small text-only model, so its request must be something a text
+/// model can always take. The placeholder keeps the fact that an attachment is part of the
+/// task — "summarize this screenshot" and "summarize this" are different tasks — without
+/// forwarding any payload bytes. Blocks that are already text, and tool traffic, return
+/// `None` and are kept as they are.
+pub(crate) fn attachment_placeholder(block: &ContentBlock) -> Option<String> {
+    match block {
+        ContentBlock::Image { .. } => Some("[image attachment]".to_string()),
+        ContentBlock::File { source } => Some(match source {
+            FileSource::FileData {
+                filename: Some(name),
+                ..
+            } => format!("[file attachment: {name}]"),
+            _ => "[file attachment]".to_string(),
+        }),
+        ContentBlock::Audio { .. } => Some("[audio attachment]".to_string()),
+        ContentBlock::Video { .. } => Some("[video attachment]".to_string()),
+        ContentBlock::Unknown { .. } => Some("[unsupported attachment]".to_string()),
+        ContentBlock::Text { .. }
+        | ContentBlock::Refusal { .. }
+        | ContentBlock::Reasoning { .. }
+        | ContentBlock::ToolCall(_)
+        | ContentBlock::ToolResult(_) => None,
+    }
+}
+
+/// The text projection of one message, as shown to a judge.
+///
+/// Attachments become placeholders (see [`attachment_placeholder`]); text, refusals,
+/// reasoning and tool blocks are unchanged, so the tool-pair window rule still holds. A
+/// message without attachments is returned as an identical clone.
+pub(crate) fn judge_view(message: &Message) -> Message {
+    let content = message
+        .content
+        .iter()
+        .map(|block| match attachment_placeholder(block) {
+            Some(text) => ContentBlock::Text { text },
+            None => block.clone(),
+        })
+        .collect();
+    Message {
+        role: message.role,
+        content,
+    }
+}
+
 /// Reusable structured judge assembled from an input view, contract, and verdict decoder.
 pub(crate) struct StructuredJudge<I, D> {
     input: I,
@@ -144,7 +193,15 @@ where
     type Verdict = D::Verdict;
 
     fn build_request(&self, state: &State, request: &Request) -> Request {
-        let messages = self.input.build_messages(state, request);
+        // Whatever view the input selects, the judge itself only ever sees text: a
+        // client attachment forwarded verbatim would make a text-only judge reject the
+        // whole request and the route fall open on every attached turn.
+        let messages: Vec<Message> = self
+            .input
+            .build_messages(state, request)
+            .iter()
+            .map(judge_view)
+            .collect();
         Request {
             llm_request: LlmRequest {
                 model: request.llm_request.model.clone(),
@@ -647,6 +704,145 @@ mod tests {
         for reply in ["```json\n{\"ok\":true}\n```", "```\n{\"ok\":true}\n```"] {
             assert!(judge.parse(&text_response(None, reply))?.ok);
         }
+        Ok(())
+    }
+    #[test]
+    fn judge_view_replaces_attachments_with_placeholders() {
+        use switchyard_protocol::{ImageSource, ToolCall};
+
+        let message = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "summarize this screenshot".to_string(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: Some("image/png".to_string()),
+                        data: "iVBORw0KGgo=".to_string(),
+                    },
+                },
+                ContentBlock::File {
+                    source: FileSource::FileData {
+                        data: "aGVsbG8=".to_string(),
+                        filename: Some("notes.pdf".to_string()),
+                    },
+                },
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call-1".to_string(),
+                    name: "bash".to_string(),
+                    arguments: serde_json::json!({"cmd": "ls"}),
+                }),
+            ],
+        };
+        let view = judge_view(&message);
+        assert_eq!(view.role, Role::User);
+        assert_eq!(
+            view.content,
+            vec![
+                ContentBlock::Text {
+                    text: "summarize this screenshot".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "[image attachment]".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "[file attachment: notes.pdf]".to_string(),
+                },
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call-1".to_string(),
+                    name: "bash".to_string(),
+                    arguments: serde_json::json!({"cmd": "ls"}),
+                }),
+            ]
+        );
+        let serialized = serde_json::to_string(&view).unwrap();
+        assert!(!serialized.contains("iVBORw0KGgo="), "{serialized}");
+        assert!(!serialized.contains("aGVsbG8="), "{serialized}");
+    }
+
+    #[test]
+    fn judge_view_keeps_text_only_messages_identical() {
+        let message = Message::text(Role::User, "judge this");
+        assert_eq!(judge_view(&message), message);
+    }
+
+    #[test]
+    fn structured_judge_never_forwards_an_image_to_the_judge() -> Result<()> {
+        use super::super::classifier_contract::ClassifierContractConfig;
+        use switchyard_protocol::ImageSource;
+
+        /// Hands the judge the whole conversation, like a windowed capability input.
+        struct Everything;
+        impl ClassifierInput for Everything {
+            fn build_messages(&self, _state: &State, request: &Request) -> Vec<Message> {
+                request.llm_request.messages.clone()
+            }
+        }
+
+        let contract = ClassifierContract::from_config(
+            &ClassifierContractConfig::default(),
+            "Return one JSON verdict.",
+            r#"{
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "TestVerdict",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"ok": {"type": "boolean"}},
+                        "required": ["ok"],
+                        "additionalProperties": false
+                    }
+                }
+            }"#,
+        )?;
+        let judge: StructuredJudge<Everything, SerdeDecoder<TestVerdict>> =
+            StructuredJudge::new(
+                Everything,
+                contract,
+                SerdeDecoder::new(),
+                JudgeRuntimeConfig::new(64)?,
+            );
+
+        let mut request = request();
+        request.llm_request.messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "what colour is this".to_string(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Url {
+                        url: "https://example.invalid/shot.png".to_string(),
+                        detail: None,
+                    },
+                },
+            ],
+        }];
+        let judged = judge.build_request(&State::default(), &request);
+        let has_image = judged
+            .llm_request
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .any(|block| matches!(block, ContentBlock::Image { .. }));
+        assert!(!has_image, "{:?}", judged.llm_request.messages);
+        assert!(
+            judged.llm_request.messages[0].content.contains(&ContentBlock::Text {
+                text: "[image attachment]".to_string(),
+            }),
+            "{:?}",
+            judged.llm_request.messages
+        );
+        // The caller's request is untouched: the projection is a judge-side view only.
+        assert!(
+            request
+                .llm_request
+                .messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .any(|block| matches!(block, ContentBlock::Image { .. }))
+        );
         Ok(())
     }
 }
