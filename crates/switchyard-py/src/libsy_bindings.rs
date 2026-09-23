@@ -14,8 +14,9 @@ use pyo3::prelude::*;
 use serde_json::Value;
 use switchyard_libsy::{
     Algorithm, CallModel, ClassifierContractConfig, ClassifierResponseFormat, ClassifyTrigger,
-    CustomClassifierConfig, CustomClassifierPolicy, EscalationJudgeConfig, HandoffNoteConfig,
-    LibsyError as RustLibsyError, LlmClassifierConfig, LlmFallback, LlmTaskClassifier, Noop,
+    CustomClassifierConfig, CustomClassifierPolicy, DEFAULT_UNMATCHED_STEPS,
+    EscalationJudgeConfig, HandoffNoteConfig, LibsyError as RustLibsyError, LlmClassifierConfig,
+    LlmFallback, LlmTaskClassifier, Noop,
     PickerMode, Random, RoutingOutcome, RuntimeModels, StageRouter, StageRouterConfig,
     Step as RustStep, StepStream, TaskClassifierConfig, ToolSemantics,
 };
@@ -281,6 +282,7 @@ impl PyTaskClassifierConfig {
             inner: TaskClassifierConfig {
                 base_threshold,
                 threshold_step,
+                unmatched_steps: DEFAULT_UNMATCHED_STEPS,
                 classify_trigger: classify_trigger(session_affinity),
                 message_hash_fallback,
                 recent_turn_window,
