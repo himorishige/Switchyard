@@ -238,7 +238,11 @@ fn collect_text(content: &[ContentBlock], parts: &mut Vec<String>) {
                 parts.push(format!("tool_call {}({})", call.name, call.arguments));
             }
             ContentBlock::ToolResult(result) => collect_text(&result.content, parts),
-            _ => {}
+            _ => {
+                if let Some(marker) = super::judge_text::attachment_marker(block) {
+                    parts.push(marker.to_string());
+                }
+            }
         }
     }
 }
